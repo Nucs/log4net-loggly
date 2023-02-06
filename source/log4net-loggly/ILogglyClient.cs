@@ -1,6 +1,11 @@
+using System;
+using System.IO;
+using System.Net.Http;
+using System.Threading.Tasks;
+
 namespace log4net.loggly
 {
-    internal interface ILogglyClient
+    internal interface ILogglyClient : IDisposable
     {
         /// <summary>
         /// Send array of messages to Loggly
@@ -9,7 +14,7 @@ namespace log4net.loggly
         /// Number of valid messages in buffer is passed via <paramref name="numberOfMessages"/> parameters.
         /// Anything past this number should be ignored.
         /// </param>
-        /// <param name="numberOfMessages">Number of messages from buffer to send.</param>
-        void Send(string[] messagesBuffer, int numberOfMessages);
+        /// <exception cref="HttpRequestException">When the loggly token is invalid</exception>
+        ValueTask SendAsync(MemoryStream messagesBuffer);
     }
 }

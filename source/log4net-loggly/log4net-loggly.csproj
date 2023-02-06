@@ -23,6 +23,7 @@
     <Copyright>Copyright 2019</Copyright>
     <PackageTags>Loggly-log4net log4net appender logs</PackageTags>
     <RootNamespace>log4net.loggly</RootNamespace>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
   </PropertyGroup>
 
   <ItemGroup>

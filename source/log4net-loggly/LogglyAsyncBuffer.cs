@@ -1,52 +1,78 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.IO;
+using System.Net.Http;
+using System.Runtime.CompilerServices;
+using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
-namespace log4net.loggly
-{
-    internal class LogglyAsyncBuffer : ILogglyAsyncBuffer
-    {
+namespace log4net.loggly {
+    internal class LogglyAsyncBuffer : ILogglyAsyncBuffer, IDisposable {
         private readonly Config _config;
         private readonly ConcurrentQueue<string> _messages = new ConcurrentQueue<string>();
-        private readonly ManualResetEvent _stopEvent = new ManualResetEvent(false);
-        private readonly ManualResetEvent _readyToSendEvent = new ManualResetEvent(false);
-        private readonly ManualResetEvent _flushingEvent = new ManualResetEvent(false);
-        private volatile bool _sendInProgress;
+        private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(0, 1);
+        private readonly ManualResetEventSlim _flushCompletion = new ManualResetEventSlim(false);
         private readonly ILogglyClient _client;
+        private readonly CancellationTokenSource _cancellation;
+        private static readonly Encoding _encoding = Encoding.UTF8;
+        private static readonly byte[] _newLine;
+        private int _messagesCount;
+        private Exception _innerException;
 
-        public LogglyAsyncBuffer(Config config, ILogglyClient client)
-        {
+        static LogglyAsyncBuffer() {
+            _newLine = _encoding.GetBytes(Environment.NewLine);
+        }
+
+        public LogglyAsyncBuffer(Config config, ILogglyClient client) {
             _config = config;
             _client = client;
-            var sendingThread = new Thread(DoSend)
-            {
-                Name = "LogglySendThread",
-                IsBackground = true
-            };
-            sendingThread.Start();
+            _cancellation = new CancellationTokenSource();
+            _ = Task.Run(LogglySendBufferTask, _cancellation.Token);
+            if (config.PassivelyFlushEvery.HasValue) {
+                _config.PassivelyFlushEvery = TimeSpan.FromSeconds(Math.Max(10, _config.PassivelyFlushEvery!.Value.TotalSeconds));
+                _ = Task.Run(LogglyTimedSendTask, _cancellation.Token);
+            }
+        }
+
+        private async Task LogglyTimedSendTask() {
+            //make sure it is atleast every 10s
+            while (!_cancellation.IsCancellationRequested) {
+                try {
+                    //sleep for configured time
+                    await Task.Delay(_config.PassivelyFlushEvery.Value!, _cancellation.Token);
+                } catch (TaskCanceledException) {
+                    break;
+                } catch (OperationCanceledException) {
+                    break;
+                }
+
+                //only if we have pending items
+                if (_messagesCount == 0)
+                    continue;
+
+                //signal the buffer to flush
+                try {
+                    _semaphore.Release(1);
+                } catch (SemaphoreFullException) { }
+            }
         }
 
         /// <summary>
         /// Buffer message to be sent to Loggly
         /// </summary>
-        public void BufferForSend(string message)
-        {
+        public void BufferForSend(string message) {
+            if (_cancellation.IsCancellationRequested)
+                throw new OperationCanceledException($"Unable to log to loggly because operation was cancelled due to previous error or disposal. See inner exception for details.", _innerException, _cancellation.Token);
+
             _messages.Enqueue(message);
 
-            // initiate send if sending one by one or if there is already enough messages for batch
-            if (_messages.Count >= _config.BufferSize)
-            {
-                _readyToSendEvent.Set();
-            }
-
-            // keep the queue size under limit if any limit is set
-            if (_config.MaxLogQueueSize > 0)
-            {
-                while (_messages.Count > _config.MaxLogQueueSize)
-                {
-                    _messages.TryDequeue(out _);
-                }
+            // increment the count of messages in the buffer and release the semaphore if we have enough messages
+            if (Interlocked.Increment(ref _messagesCount) % _config.BufferSize == 0) {
+                try {
+                    _semaphore.Release(1);
+                } catch (SemaphoreFullException) { }
             }
         }
 
@@ -55,63 +81,124 @@ namespace log4net.loggly
         /// This method returns once all messages are flushed or when timeout expires.
         /// If new messages are coming during flush they will be included and may delay flush operation.
         /// </summary>
-        public bool Flush(TimeSpan maxWait)
-        {
-            Stopwatch flushWatch = Stopwatch.StartNew();
-            SpinWait spinWait = new SpinWait();
-            int messagesCount;
-            while (((messagesCount = _messages.Count) > 0 || _sendInProgress) && flushWatch.Elapsed < maxWait)
-            {
-                _flushingEvent.Set();
-                spinWait.SpinOnce();
-            }
+        public bool Flush(TimeSpan maxWait) {
+            if (_cancellation.IsCancellationRequested)
+                throw new OperationCanceledException($"Unable to log to loggly because operation was cancelled due to previous error or disposal. See inner exception for details.", _innerException, _cancellation.Token);
 
-            return messagesCount == 0 && !_sendInProgress;
+            if (_messagesCount == 0)
+                return true;
+
+            try {
+                _semaphore.Release(1);
+            } catch (SemaphoreFullException) { }
+
+            return maxWait.Ticks == 0 || //TimeSpan.Zero
+                   _flushCompletion.Wait(maxWait);
         }
 
-        private void DoSend()
-        {
-            var sendBuffer = new string[_config.BufferSize];
+        private async Task LogglySendBufferTask() {
+            try {
+                var bufferSize = _config.BufferSize;
+                var cancelToken = _cancellation.Token;
+                string nextMessage = null; //holder for a message that is too large for the current batch to avoid double lookup of _messages
+                DateTime _lastSend = DateTime.MinValue;
+                using MemoryStream ms = new MemoryStream(_config.MaxBulkSizeBytes);
+                bool cancelling = false;
 
-            // WaitAny returns index of completed task or WaitTimeout value (number) in case of timeout.
-            // We want to continue unless _stopEvent was set, so unless returned value is 0 - index of _stopEvent
-            int flushingHandleIndex = 2;
-            var handles = new WaitHandle[] { _stopEvent, _readyToSendEvent, _flushingEvent };
+                while (true) {
+                    try {
+                        //await buffer to fill up
+                        await _semaphore.WaitAsync(cancelToken).ConfigureAwait(false);
+                    } catch (OperationCanceledException) {
+                        //we ignore cancellation to sumbit remainder
+                        cancelling = true;
+                    }
 
-            int triggeredBy;
-            while ((triggeredBy = WaitHandle.WaitAny(handles, _config.SendInterval)) != 0)
-            {
-                // allow sending partial buffer only when it was triggered by timeout or flush
-                if (triggeredBy != WaitHandle.WaitTimeout && triggeredBy != flushingHandleIndex && _messages.Count < sendBuffer.Length)
-                {
-                    _readyToSendEvent.Reset();
-                    continue;
+                    while (_messagesCount > 0) {
+                        try {
+                            //handle send interval
+                            var now = DateTime.UtcNow;
+                            if (_lastSend > now) {
+                                await Task.Delay(_lastSend - now, cancelToken).ConfigureAwait(false);
+                            }
+
+                            _lastSend = now + _config.SendInterval;
+                        } catch (OperationCanceledException) {
+                            //we ignore cancellation to sumbit remainder
+                            cancelling = true;
+                        }
+
+                        int sendBufferIndex = 0;
+                        while (sendBufferIndex < bufferSize //iterate buffer size
+                               && (nextMessage != null || _messages.TryDequeue(out nextMessage)) //get next message or last too large message
+                               && (ms.Length == 0 || ms.Length + nextMessage.Length <= _config.MaxBulkSizeBytes)) { //first message or fits in bulk
+
+                            // peek/dequeue happens only in one thread so what we peeked above is what we dequeue here
+
+                            sendBufferIndex++;
+                            WriteMessage(nextMessage, ms, sendBufferIndex >= bufferSize);
+
+                            //reset next message, if won't be null for next iteration if we have a message that is too large for the current batch
+                            nextMessage = null;
+                        }
+
+                        if (sendBufferIndex > 0) {
+                            //update messages count
+                            Interlocked.Add(ref _messagesCount, -sendBufferIndex); //remove messages count to reset triggers
+
+                            try {
+                                await _client.SendAsync(ms).ConfigureAwait(false);
+                            } catch (HttpRequestException e) {
+                                //incase of token exception
+                                _innerException = e;
+                                Dispose();
+                                return;
+                            } finally {
+                                ms.SetLength(0); //clear buffer
+                            }
+                        }
+                    }
+
+                    _flushCompletion.Set(); //signal all flush waiters
+                    _flushCompletion.Reset(); //reset for next flush waiters
+
+                    if (cancelling)
+                        break;
                 }
-
-                _sendInProgress = true;
-                int sendBufferIndex = 0;
-                int bulkSize = 0;
-                while (sendBufferIndex < sendBuffer.Length 
-                    && _messages.TryPeek(out var message)
-                    && bulkSize + message.Length <= _config.MaxBulkSizeBytes)
-                {
-                    bulkSize += message.Length;
-                    // peek/dequeue happens only in one thread so what we peeked above is what we dequeue here
-                    _messages.TryDequeue(out _);
-                    sendBuffer[sendBufferIndex++] = message;
-                }
-
-                if (sendBufferIndex > 0)
-                {
-                    _client.Send(sendBuffer, sendBufferIndex);
-                }
-                _sendInProgress = false;
+            } catch (Exception e) {
+                _innerException = e;
             }
         }
 
-        public void Dispose()
-        {
-            _stopEvent.Set();
+        #if !NETSTANDARD2_1
+        [MethodImpl(MethodImplOptions.AggressiveOptimization)]
+        #endif
+        private void WriteMessage(string nextMessage, MemoryStream ms, bool isLast) {
+            var size = _encoding.GetByteCount(nextMessage);
+            Span<byte> buffer = stackalloc byte[size + (isLast ? 0 : _newLine.Length)];
+            if (!isLast) {
+                var written = _encoding.GetBytes(nextMessage, buffer);
+                for (int i = 0; i < _newLine.Length; i++)
+                    buffer[written + i] = _newLine[i];
+
+                ms.Write(buffer.Slice(0, written + _newLine.Length));
+            } else {
+                var written = _encoding.GetBytes(nextMessage, buffer);
+                ms.Write(buffer.Slice(0, written));
+            }
+        }
+
+        public void Dispose() {
+            try {
+                _cancellation.Cancel();
+                _cancellation.Dispose();
+            } catch (ObjectDisposedException) { }
+
+            try {
+                _flushCompletion.Dispose();
+            } catch (ObjectDisposedException) { }
+
+            //not disposing _client due to possability of late send
         }
     }
 }

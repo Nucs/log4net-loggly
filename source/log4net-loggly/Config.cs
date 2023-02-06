@@ -18,14 +18,14 @@ namespace log4net.loggly
             BufferSize = 500;
             NumberOfInnerExceptions = 4;
             SendInterval = TimeSpan.FromSeconds(5);
-            MaxLogQueueSize = 0; // unlimited
-            FinalFlushWaitTime = TimeSpan.FromSeconds(3);
+            FinalFlushWaitTime = TimeSpan.FromSeconds(10);
+            PassivelyFlushEvery = TimeSpan.FromMinutes(2);
 
             // Limitation of HTTP endpoint is 1MB per event, 5MB per bulk:
             // https://www.loggly.com/docs/http-endpoint/ and https://www.loggly.com/docs/http-bulk-endpoint/
             
             // max 5MB per bulk (real 5*1024*1024 is still rejected so stay a bit under the limit)
-            MaxBulkSizeBytes = 5242000;
+            MaxBulkSizeBytes = 4717712; // 4.5mb
             // Real 1024*1024 is still too much for HTTP endpoint so let's stay on safe side with 1000*1000
             MaxEventSizeBytes = 1000000;
         }
@@ -67,10 +67,6 @@ namespace log4net.loggly
         /// </summary>
         public int BufferSize { get; set; }
         /// <summary>
-        /// Maximal size of queue holding logs before send
-        /// </summary>
-        public int MaxLogQueueSize { get; set; }
-        /// <summary>
         /// How many inner exceptions should be sent to Loggly
         /// </summary>
         public int NumberOfInnerExceptions { get; set; }
@@ -82,6 +78,10 @@ namespace log4net.loggly
         /// How long to wait during final appender flush until all messages are flushed.
         /// </summary>
         public TimeSpan FinalFlushWaitTime { get; set; }
+        /// <summary>
+        /// How often should the events buffer be sent if it's not yet full. If null, then it's not used.
+        /// </summary>
+        public TimeSpan? PassivelyFlushEvery { get; set; }
         /// <summary>
         /// Request timeout when sending logs to Loggly
         /// </summary>
