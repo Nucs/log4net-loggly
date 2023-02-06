@@ -2,6 +2,7 @@ using System;
 using System.Collections;
 using System.Diagnostics;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Text;
 using log4net.Core;
 using Newtonsoft.Json;
@@ -11,29 +12,44 @@ namespace log4net.loggly
 {
     internal class LogglyFormatter : ILogglyFormatter
     {
+        private static readonly string _machineName;
         private readonly Config _config;
-        private readonly Process _currentProcess;
-        private readonly JsonSerializer _jsonSerializer = JsonSerializer.CreateDefault(new JsonSerializerSettings
+        private static readonly string _currentProcessName;
+
+        private static readonly JsonSerializer _jsonSerializer = JsonSerializer.CreateDefault(new JsonSerializerSettings
         {
             PreserveReferencesHandling = PreserveReferencesHandling.Arrays,
             ReferenceLoopHandling = ReferenceLoopHandling.Ignore
         });
+        
+        private static readonly JsonSerializerSettings _jObjectJsonSerializerSettings = new JsonSerializerSettings
+        {
+            ReferenceLoopHandling = ReferenceLoopHandling.Ignore
+        };
+        
+        private static readonly JsonMergeSettings _mergeSettings = new JsonMergeSettings
+        {
+            MergeArrayHandling = MergeArrayHandling.Union
+        };
 
+        static LogglyFormatter() {
+            _machineName = Environment.MachineName;
+            _currentProcessName = Process.GetCurrentProcess().ProcessName;
+        }
+        
         public LogglyFormatter(Config config)
         {
             _config = config;
-            _currentProcess = Process.GetCurrentProcess();
         }
 
         public string ToJson(LoggingEvent loggingEvent, string renderedMessage)
         {
             // formatting base logging info
-            JObject loggingInfo = new JObject
-            {
+            JObject loggingInfo = new JObject {
                 ["timestamp"] = loggingEvent.TimeStamp.ToString(@"yyyy-MM-ddTHH\:mm\:ss.fffzzz"),
                 ["level"] = loggingEvent.Level?.DisplayName,
-                ["hostName"] = Environment.MachineName,
-                ["process"] = _currentProcess.ProcessName,
+                ["hostName"] = _machineName,
+                ["process"] = _currentProcessName,
                 ["threadName"] = loggingEvent.ThreadName,
                 ["loggerName"] = loggingEvent.LoggerName
             };
@@ -77,57 +93,51 @@ namespace log4net.loggly
             return resultEvent;
         }
 
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static string ToJsonString(JObject loggingInfo)
         {
-            return JsonConvert.SerializeObject(
-                loggingInfo,
-                new JsonSerializerSettings
-                {
-                    ReferenceLoopHandling = ReferenceLoopHandling.Ignore,
-                });
+            return JsonConvert.SerializeObject(loggingInfo, _jObjectJsonSerializerSettings);
         }
 
         private void AddContextProperties(JObject loggingInfo, LoggingEvent loggingEvent)
         {
             if (_config.GlobalContextKeys != null)
             {
-                var globalContextProperties = _config.GlobalContextKeys.Split(',');
-                foreach (var key in globalContextProperties)
+                var properties = GlobalContext.Properties;
+                foreach (var key in _config.GlobalContextKeysSplit)
                 {
-                    if (TryGetPropertyValue(GlobalContext.Properties[key], out var propertyValue))
+                    if (TryGetPropertyValue(properties[key], out var propertyValue))
                     {
                         loggingInfo[key] = JToken.FromObject(propertyValue);
                     }
                 }
             }
+            
+            if (_config.IncludeThreadInformation) {
+                var threadProperties = ThreadContext.Properties;
+                var threadContextProperties = threadProperties.GetKeys();
+                if (threadContextProperties != null && threadContextProperties.Length > 0) {
+                    foreach (var key in threadContextProperties) {
+                        if (TryGetPropertyValue(threadProperties[key], out var propertyValue)) {
+                            loggingInfo[key] = JToken.FromObject(propertyValue);
+                        }
+                    }
+                }
 
-            var threadContextProperties = ThreadContext.Properties.GetKeys();
-            if (threadContextProperties != null && threadContextProperties.Any())
-            {
-                foreach (var key in threadContextProperties)
-                {
-                    if (TryGetPropertyValue(ThreadContext.Properties[key], out var propertyValue))
-                    {
-                        loggingInfo[key] = JToken.FromObject(propertyValue);
+                if (_config.LogicalThreadContextKeys != null) {
+                    var properties = LogicalThreadContext.Properties;
+                    foreach (var key in _config.LogicalThreadContextKeysSplit) {
+                        if (TryGetPropertyValue(properties[key], out var propertyValue)) {
+                            loggingInfo[key] = JToken.FromObject(propertyValue);
+                        }
                     }
                 }
             }
-
-            if (_config.LogicalThreadContextKeys != null)
+            
+            var loggingEventProperties = loggingEvent.GetProperties();
+            if (loggingEventProperties.Count > 0)
             {
-                var logicalThreadContextProperties = _config.LogicalThreadContextKeys.Split(',');
-                foreach (var key in logicalThreadContextProperties)
-                {
-                    if (TryGetPropertyValue(LogicalThreadContext.Properties[key], out var propertyValue))
-                    {
-                        loggingInfo[key] = JToken.FromObject(propertyValue);
-                    }
-                }
-            }
-
-            if (loggingEvent.Properties.Count > 0)
-            {
-                foreach (DictionaryEntry property in loggingEvent.Properties)
+                foreach (DictionaryEntry property in loggingEventProperties)
                 {
                     if (TryGetPropertyValue(property.Value, out var propertyValue))
                     {
@@ -139,7 +149,7 @@ namespace log4net.loggly
 
         private void AddExceptionIfPresent(JObject loggingInfo, LoggingEvent loggingEvent)
         {
-            dynamic exceptionInfo = GetExceptionInfo(loggingEvent);
+            JObject exceptionInfo = GetExceptionInfo(loggingEvent);
             if (exceptionInfo != null)
             {
                 loggingInfo["exception"] = exceptionInfo;
@@ -150,17 +160,13 @@ namespace log4net.loggly
         {
             if (loggingEvent.MessageObject is string messageString)
             {
-                if (CanBeJson(messageString))
+                if (messageString.IndexOf('{', 0, Math.Min(20, messageString.Length)) != -1) // quick check if there is a chance of JSON
                 {
                     // try parse as JSON, otherwise use rendered message passed to this method
                     try
                     {
                         var json = JObject.Parse(messageString);
-                        loggingInfo.Merge(json,
-                            new JsonMergeSettings
-                            {
-                                MergeArrayHandling = MergeArrayHandling.Union
-                            });
+                        loggingInfo.Merge(json,_mergeSettings);
                         // we have all we need
                         return;
                     }
@@ -171,7 +177,7 @@ namespace log4net.loggly
                 }
 
                 // plain string, use rendered message
-                loggingInfo["message"] = GetStringFormLog(renderedMessage);
+                loggingInfo["message"] = NormalizeNull(renderedMessage);
             }
             else if (loggingEvent.MessageObject == null
                     // log4net.Util.SystemStringFormat is object used when someone calls log.*Format(...)
@@ -181,17 +187,13 @@ namespace log4net.loggly
                     // but then it should be already in renderedMessage
                     || (loggingEvent.MessageObject.GetType().FullName?.Contains("StringFormatFormattedMessage") ?? false))
             {
-                loggingInfo["message"] = GetStringFormLog(renderedMessage);
+                loggingInfo["message"] = NormalizeNull(renderedMessage);
             }
             else
             {
                 // serialize object to JSON and add it's properties to loggingInfo
                 var json = JObject.FromObject(loggingEvent.MessageObject, _jsonSerializer);
-                loggingInfo.Merge(json,
-                    new JsonMergeSettings
-                    {
-                        MergeArrayHandling = MergeArrayHandling.Union
-                    });
+                loggingInfo.Merge(json, _mergeSettings);
             }
         }
 
@@ -248,29 +250,8 @@ namespace log4net.loggly
             return result;
         }
 
-        private bool CanBeJson(string message)
-        {
-            // This loop is about 2x faster than message.TrimStart().StartsWith("{") and about 4x faster than Regex("^\s*\{")
-            foreach (var t in message)
-            {
-                // skip leading whitespaces
-                if (char.IsWhiteSpace(t))
-                {
-                    continue;
-                }
-                // if first character after whitespace is { then this can be a JSON, otherwise not
-                if (t == '{')
-                {
-                    return true;
-                }
-
-                return false;
-            }
-
-            return false;
-        }
-
-        private string GetStringFormLog(string value)
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private string NormalizeNull(string? value)
         {
             return !string.IsNullOrEmpty(value) ? value : "null";
         }
