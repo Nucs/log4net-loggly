@@ -34,6 +34,10 @@ namespace log4net.loggly {
                 _config.PassivelyFlushEvery = TimeSpan.FromSeconds(Math.Max(10, _config.PassivelyFlushEvery!.Value.TotalSeconds));
                 _ = Task.Run(LogglyTimedSendTask, _cancellation.Token);
             }
+
+            var appDomain = AppDomain.CurrentDomain;
+            if (appDomain != null) //unit test env
+                AppDomain.CurrentDomain.ProcessExit += CurrentDomainOnProcessExit;
         }
 
         private async Task LogglyTimedSendTask() {
@@ -188,6 +192,17 @@ namespace log4net.loggly {
             }
         }
 
+        private void CurrentDomainOnProcessExit(object sender, EventArgs e) {
+            try {
+                if (_messagesCount > 0) {
+                    _semaphore.Release(1);
+                    Flush(TimeSpan.FromSeconds(10));
+                }
+            } catch (Exception) {
+                // ignored
+            }
+        }
+
         public void Dispose() {
             try {
                 _cancellation.Cancel();
@@ -199,6 +214,10 @@ namespace log4net.loggly {
             } catch (ObjectDisposedException) { }
 
             //not disposing _client due to possability of late send
+
+            var appDomain = AppDomain.CurrentDomain;
+            if (appDomain != null) //unit test env
+                AppDomain.CurrentDomain.ProcessExit -= CurrentDomainOnProcessExit;
         }
     }
 }
