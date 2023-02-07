@@ -9,7 +9,7 @@
     <Company>Loggly</Company>
     <PackageLicenseUrl>http://opensource.org/licenses/MIT</PackageLicenseUrl>
     <Product>Loggly</Product>
-    <PackageProjectUrl>http://github.com/Nucs/log4net-loggly</PackageProjectUrl>
+    <PackageProjectUrl>http://github.com/Nucs/log4net-loggly-async</PackageProjectUrl>
     <Description>Custom log4net Appender to send logs to Loggly</Description>
     <PackageReleaseNotes>- Upgraded LogglyAsyncBuffer to use ThreadPool async
 - Proper error handling on next write or flush
@@ -28,6 +28,10 @@
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <PackageId>log4net-loggly-async</PackageId>
     <Nullable>enable</Nullable>
+    <IncludeDocumentationProjectOutputGroup>true</IncludeDocumentationProjectOutputGroup>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <AssemblyName>log4net-loggly-async</AssemblyName>
+    <DebugSymbols>true</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
