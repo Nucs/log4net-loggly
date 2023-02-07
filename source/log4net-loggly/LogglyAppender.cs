@@ -57,8 +57,8 @@ namespace log4net.loggly
         protected override void OnClose()
         {
             base.OnClose();
-            _buffer.Flush(_config.FinalFlushWaitTime);
-            _buffer.Dispose();
+            if (_buffer.Flush(_config.FinalFlushWaitTime))
+                _buffer.Dispose(); //only dispose if flush was succesfull, otherwise let exit events handle that.
             _buffer = null;
         }
 

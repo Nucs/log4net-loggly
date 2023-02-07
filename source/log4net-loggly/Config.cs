@@ -1,4 +1,5 @@
 using System;
+using System.Diagnostics;
 
 namespace log4net.loggly {
     /// <summary>
@@ -20,7 +21,7 @@ namespace log4net.loggly {
             BufferSize = 500;
             NumberOfInnerExceptions = 4;
             SendInterval = TimeSpan.FromSeconds(5);
-            FinalFlushWaitTime = TimeSpan.FromSeconds(10);
+            FinalFlushWaitTime = Debugger.IsAttached ? TimeSpan.FromMinutes(10) : TimeSpan.FromSeconds(10);
             PassivelyFlushEvery = TimeSpan.FromMinutes(2);
 
             // Limitation of HTTP endpoint is 1MB per event, 5MB per bulk:

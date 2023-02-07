@@ -19,7 +19,9 @@ namespace log4net.loggly {
         private static readonly Encoding _encoding = Encoding.UTF8;
         private static readonly byte[] _newLine;
         private int _messagesCount;
-        private Exception _innerException;
+        private Exception? _innerException;
+        private bool _exiting;
+        private readonly Process? _currentProcess;
 
         static LogglyAsyncBuffer() {
             _newLine = _encoding.GetBytes(Environment.NewLine);
@@ -35,9 +37,21 @@ namespace log4net.loggly {
                 _ = Task.Run(LogglyTimedSendTask, _cancellation.Token);
             }
 
-            var appDomain = AppDomain.CurrentDomain;
-            if (appDomain != null) //unit test env
-                AppDomain.CurrentDomain.ProcessExit += CurrentDomainOnProcessExit;
+            try {
+                //attempt peacefully to register for appdomain exit
+                var appDomain = AppDomain.CurrentDomain;
+                if (appDomain != null) //unit test env
+                    AppDomain.CurrentDomain.ProcessExit += OnUnexpectedExit;
+            } catch (Exception) { }
+
+            try {
+                //attempt peacefully to register for process exit
+                _currentProcess = Process.GetCurrentProcess();
+                _currentProcess.Exited += OnUnexpectedExit;
+                _currentProcess.EnableRaisingEvents = true;
+            } catch (Exception) {
+                //ignored
+            }
         }
 
         private async Task LogglyTimedSendTask() {
@@ -59,7 +73,9 @@ namespace log4net.loggly {
                 //signal the buffer to flush
                 try {
                     _semaphore.Release(1);
-                } catch (SemaphoreFullException) { }
+                } catch (SemaphoreFullException) { } catch (ObjectDisposedException) {
+                    break;
+                }
             }
         }
 
@@ -73,10 +89,13 @@ namespace log4net.loggly {
             _messages.Enqueue(message);
 
             // increment the count of messages in the buffer and release the semaphore if we have enough messages
-            if (Interlocked.Increment(ref _messagesCount) % _config.BufferSize == 0) {
+            var count = Interlocked.Increment(ref _messagesCount);
+            if (count % _config.BufferSize == 0) {
                 try {
                     _semaphore.Release(1);
                 } catch (SemaphoreFullException) { }
+            } else if (count == 1) {
+                _flushCompletion.Reset(); //reset for next flush waiters
             }
         }
 
@@ -86,36 +105,35 @@ namespace log4net.loggly {
         /// If new messages are coming during flush they will be included and may delay flush operation.
         /// </summary>
         public bool Flush(TimeSpan maxWait) {
-            if (_cancellation.IsCancellationRequested)
-                throw new OperationCanceledException($"Unable to log to loggly because operation was cancelled due to previous error or disposal. See inner exception for details.", _innerException, _cancellation.Token);
-
             if (_messagesCount == 0)
                 return true;
 
             try {
                 _semaphore.Release(1);
-            } catch (SemaphoreFullException) { }
+            } catch (SemaphoreFullException) { } catch (ObjectDisposedException) { }
 
-            return maxWait.Ticks == 0 || //TimeSpan.Zero
-                   _flushCompletion.Wait(maxWait);
+            try {
+                return maxWait.Ticks == 0 || //TimeSpan.Zero
+                       _flushCompletion.Wait(maxWait);
+            } catch (ObjectDisposedException) {
+                return true; //assume flush is done
+            }
         }
 
         private async Task LogglySendBufferTask() {
             try {
                 var bufferSize = _config.BufferSize;
                 var cancelToken = _cancellation.Token;
-                string nextMessage = null; //holder for a message that is too large for the current batch to avoid double lookup of _messages
+                string? nextMessage = null; //holder for a message that is too large for the current batch to avoid double lookup of _messages
                 DateTime _lastSend = DateTime.MinValue;
                 using MemoryStream ms = new MemoryStream(_config.MaxBulkSizeBytes);
-                bool cancelling = false;
 
                 while (true) {
                     try {
                         //await buffer to fill up
                         await _semaphore.WaitAsync(cancelToken).ConfigureAwait(false);
-                    } catch (OperationCanceledException) {
+                    } catch (OperationCanceledException) { } catch (ObjectDisposedException) {
                         //we ignore cancellation to sumbit remainder
-                        cancelling = true;
                     }
 
                     while (_messagesCount > 0) {
@@ -129,7 +147,6 @@ namespace log4net.loggly {
                             _lastSend = now + _config.SendInterval;
                         } catch (OperationCanceledException) {
                             //we ignore cancellation to sumbit remainder
-                            cancelling = true;
                         }
 
                         int sendBufferIndex = 0;
@@ -163,11 +180,12 @@ namespace log4net.loggly {
                         }
                     }
 
-                    _flushCompletion.Set(); //signal all flush waiters
-                    _flushCompletion.Reset(); //reset for next flush waiters
+                    //buffer emptied
+                    try {
+                        _flushCompletion.Set(); //signal all flush waiters
+                    } catch (ObjectDisposedException) { }
 
-                    if (cancelling)
-                        break;
+                    if (_exiting) break;
                 }
             } catch (Exception e) {
                 _innerException = e;
@@ -192,32 +210,67 @@ namespace log4net.loggly {
             }
         }
 
-        private void CurrentDomainOnProcessExit(object sender, EventArgs e) {
+        private void OnUnexpectedExit(object? sender, EventArgs e) {
+            if (_exiting || _messagesCount <= 0)
+                return;
+
             try {
-                if (_messagesCount > 0) {
-                    _semaphore.Release(1);
-                    Flush(TimeSpan.FromSeconds(10));
-                }
+                _exiting = true;
+                _semaphore.Release(1);
+                Flush(TimeSpan.FromSeconds(10));
             } catch (Exception) {
                 // ignored
             }
+
+            try {
+                _flushCompletion.Dispose();
+            } catch (ObjectDisposedException) { }
         }
 
         public void Dispose() {
+            try {
+                if (_innerException != null) //if not due to inner exception
+                    Flush(TimeSpan.Zero);
+            } catch (Exception) {
+                //ignored
+            }
+
             try {
                 _cancellation.Cancel();
                 _cancellation.Dispose();
             } catch (ObjectDisposedException) { }
 
             try {
-                _flushCompletion.Dispose();
+                _semaphore.Dispose();
+            } catch (ObjectDisposedException) { }
+
+            try {
+                if (!_exiting) {
+                    _flushCompletion.Set();
+                    _flushCompletion.Dispose();
+                }
             } catch (ObjectDisposedException) { }
 
             //not disposing _client due to possability of late send
+            try {
+                var appDomain = AppDomain.CurrentDomain;
+                if (appDomain != null) //unit test env
+                    AppDomain.CurrentDomain.ProcessExit -= OnUnexpectedExit;
+            } catch (Exception) {
+                //ignored
+            }
 
-            var appDomain = AppDomain.CurrentDomain;
-            if (appDomain != null) //unit test env
-                AppDomain.CurrentDomain.ProcessExit -= CurrentDomainOnProcessExit;
+            if (_currentProcess != null) {
+                try {
+                    //attempt peacefully to register for process exit
+                    _currentProcess.EnableRaisingEvents = false;
+                    _currentProcess.Exited -= OnUnexpectedExit;
+                } catch (Exception) {
+                    //ignored
+                }
+            }
+
+            _messages.Clear();
         }
     }
 }
