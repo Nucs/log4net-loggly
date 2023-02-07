@@ -1,5 +1,11 @@
 log4net-loggly
 ==============
+This is a fork that utilizes ThreadPool's Task async to flush log messages. In addition:
+- Support for unexpected shutdown and emergency flush
+- Passively flush every 2m (configurable)
+- Exceptionally fast serialization and buffering
+- Failure to log when token is incorrect. Throws exception on during log call
+
 
 Custom log4net appenders for importing logging events to loggly. It’s asynchronous and will send logs in the background without blocking your application. Check out Loggly's [.Net logging documentation](https://www.loggly.com/docs/net-logs/) to learn more.
 
@@ -7,7 +13,7 @@ Custom log4net appenders for importing logging events to loggly. It’s asynchro
 
 Download log4net-loggly package from NuGet. Use the following command.
 
-    Install-Package log4net-loggly
+    Install-Package log4net-loggly-async
 
 Add the following code in your web.config to configure LogglyAppender in your application
 ```xml
