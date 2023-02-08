@@ -1,4 +1,4 @@
-log4net-loggly
+log4net-loggly-async
 ==============
 This is a fork that utilizes ThreadPool's Task async to flush log messages. In addition:
 - Support for unexpected shutdown and emergency flush
