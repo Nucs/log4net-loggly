@@ -1,5 +1,8 @@
 log4net-loggly-async
 ==============
+[![Nuget downloads](https://img.shields.io/nuget/vpre/log4net-loggly-async.svg)](https://www.nuget.org/packages/log4net-loggly-async/)
+[![NuGet](https://img.shields.io/nuget/dt/log4net-loggly-async.svg)](https://github.com/Nucs/log4net-loggly-async)
+
 This is a fork that utilizes ThreadPool's Task async to flush log messages. In addition:
 - Support for unexpected shutdown and emergency flush
 - Passively flush every 2m (configurable)
