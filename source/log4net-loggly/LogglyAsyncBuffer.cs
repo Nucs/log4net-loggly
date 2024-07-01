@@ -18,7 +18,7 @@ namespace log4net.loggly {
         private readonly CancellationTokenSource _cancellation;
         private static readonly Encoding _encoding = Encoding.UTF8;
         private static readonly byte[] _newLine;
-        private int _messagesCount;
+        private volatile int _messagesCount;
         private Exception? _innerException;
         private bool _exiting;
         private readonly Process? _currentProcess;
@@ -40,7 +40,7 @@ namespace log4net.loggly {
             try {
                 //attempt peacefully to register for appdomain exit
                 var appDomain = AppDomain.CurrentDomain;
-                if (appDomain != null) //unit test env
+                if (appDomain != null) //unit test env might be null
                     AppDomain.CurrentDomain.ProcessExit += OnUnexpectedExit;
             } catch (Exception) { }
 
@@ -125,8 +125,8 @@ namespace log4net.loggly {
                 var bufferSize = _config.BufferSize;
                 var cancelToken = _cancellation.Token;
                 string? nextMessage = null; //holder for a message that is too large for the current batch to avoid double lookup of _messages
-                DateTime _lastSend = DateTime.MinValue;
-                using MemoryStream ms = new MemoryStream(_config.MaxBulkSizeBytes);
+                var lastSend = DateTime.MinValue;
+                using var ms = new MemoryStream(_config.MaxBulkSizeBytes);
 
                 while (true) {
                     try {
@@ -140,11 +140,11 @@ namespace log4net.loggly {
                         try {
                             //handle send interval
                             var now = DateTime.UtcNow;
-                            if (_lastSend > now) {
-                                await Task.Delay(_lastSend - now, cancelToken).ConfigureAwait(false);
+                            if (lastSend > now) {
+                                await Task.Delay(lastSend - now, cancelToken).ConfigureAwait(false);
                             }
 
-                            _lastSend = now + _config.SendInterval;
+                            lastSend = now + _config.SendInterval;
                         } catch (OperationCanceledException) {
                             //we ignore cancellation to sumbit remainder
                         }
@@ -216,7 +216,6 @@ namespace log4net.loggly {
 
             try {
                 _exiting = true;
-                _semaphore.Release(1);
                 Flush(TimeSpan.FromSeconds(10));
             } catch (Exception) {
                 // ignored

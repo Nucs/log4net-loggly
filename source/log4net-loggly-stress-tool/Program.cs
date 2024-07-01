@@ -20,7 +20,7 @@ namespace log4net_loggly_stress_tool
             var commandLine = CommandLineArgs.Parse(args);
 
             // use test HTTP layer
-            LogglyClient.WebRequestFactory = (config, url) => new TestHttpClient(commandLine.SendDelay);
+            //LogglyClient.WebRequestFactory = (config, url) => new TestHttpClient(commandLine.SendDelay);
 
             var logRepository = LogManager.GetRepository(Assembly.GetEntryAssembly());
             log4net.Config.XmlConfigurator.Configure(logRepository);

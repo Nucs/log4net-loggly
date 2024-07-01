@@ -166,7 +166,7 @@ namespace log4net.loggly
                     try
                     {
                         var json = JObject.Parse(messageString);
-                        loggingInfo.Merge(json,_mergeSettings);
+                        loggingInfo.Merge(json, _mergeSettings);
                         // we have all we need
                         return;
                     }
